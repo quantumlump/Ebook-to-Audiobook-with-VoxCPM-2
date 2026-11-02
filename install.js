@@ -1,12 +1,8 @@
 module.exports = {
-  requires: {
-    bundle: "ai"
-  },
   run: [
     {
       method: "shell.run",
       params: {
-        build: true,
         venv: "env",
         path: ".",
         message: [
