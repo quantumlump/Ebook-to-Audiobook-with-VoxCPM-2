@@ -43,3 +43,40 @@ result = client.predict(
     api_name="/basic_tts"
 )
 print("Generated audiobooks:", result)
+
+JavaScript
+
+import { Client } from "@gradio/client";
+
+const app = await Client.connect("http://127.0.0.1:7860");
+const result = await app.predict("/basic_tts", [
+  null, // ref_audio_input (null uses Voice Design with control instruction)
+  "Calm, warm audiobook narrator",
+  false,
+  "",
+  [],   // upload file handles
+  1.0,
+  250,
+  500,
+  10,
+  2.0,
+  42,
+  false
+]);
+console.log(result.data);
+
+cURL
+
+curl -X POST http://127.0.0.1:7860/gradio_api/call/show_converted_audiobooks \
+  -H "Content-Type: application/json" \
+  -d '{"data": []}'
+
+Next Steps in Pinokio
+
+1.  Make sure default_voice.mp3 is placed inside the app/ folder
+    (app/default_voice.mp3).
+2.  Click Install in Pinokio (or run Reset then Install if env already has
+    OmniVoice installed) so it installs voxcpm and downloads openbmb/VoxCPM2
+    into hf_cache.
+3.  Click Start and open the Web UI.
+
