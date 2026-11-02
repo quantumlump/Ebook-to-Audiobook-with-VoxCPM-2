@@ -1,12 +1,17 @@
 module.exports = {
-  run:[
+  requires: {
+    bundle: "ai"
+  },
+  run: [
     {
       method: "shell.run",
       params: {
         build: true,
         venv: "env",
         path: ".",
-        message: ["uv pip install wheel"],
+        message: [
+          "uv pip install wheel \"setuptools<81\""
+        ],
       },
     },
     {
@@ -27,17 +32,17 @@ module.exports = {
         },
       },
     },
-    // NEW STEP: Pre-download model weights and NLTK data during installation
+    // Pre-download NLTK tokenizers and VoxCPM 2 model weights into local hf_cache
     {
       method: "shell.run",
       params: {
         venv: "env",
         path: ".",
         env: {
-          // This forces the model to save INSIDE the app folder rather than your main C: drive
-          HF_HOME: "hf_cache" 
+          HF_HOME: "hf_cache",
+          HF_HUB_ENABLE_HF_TRANSFER: "1"
         },
-        message: "python -c \"import nltk; nltk.download('punkt'); nltk.download('punkt_tab'); from omnivoice import OmniVoice; OmniVoice.from_pretrained('k2-fsa/OmniVoice', load_asr=True)\""
+        message: "python -c \"import nltk; nltk.download('punkt'); nltk.download('punkt_tab'); from huggingface_hub import snapshot_download; snapshot_download('openbmb/VoxCPM2')\""
       }
     }
   ],
