@@ -1,0 +1,737 @@
+import os
+import shutil
+import tempfile
+import time
+import io
+import re
+import gc
+import subprocess
+import warnings
+import starlette.datastructures
+import traceback
+import uuid
+
+# --- 1. THE PINOKIO WATCHER CRASH FIX ---
+SYSTEM_TEMP = tempfile.gettempdir()
+LOCAL_TEMP = os.path.join(SYSTEM_TEMP, "omnivoice_gradio_temp")
+
+if os.path.exists(LOCAL_TEMP):
+    try:
+        shutil.rmtree(LOCAL_TEMP, ignore_errors=True)
+    except Exception:
+        pass
+os.makedirs(LOCAL_TEMP, exist_ok=True)
+os.environ["GRADIO_TEMP_DIR"] = LOCAL_TEMP
+
+# --- 2. THE FASTAPI RAM SPOOL FIX ---
+starlette.datastructures.UploadFile.spool_max_size = 100 * 1024 * 1024 
+
+
+from num2words import num2words
+from decimal import Decimal
+
+import gradio as gr
+import numpy as np
+import soundfile as sf
+import torch
+
+from bs4 import BeautifulSoup
+import nltk
+from nltk.tokenize import sent_tokenize
+
+# --- Download NLTK tokenizers if missing ---
+try:
+    nltk.data.find('tokenizers/punkt')
+    nltk.data.find('tokenizers/punkt_tab')
+except LookupError:
+    print("Downloading required NLTK tokenizers...")
+    try:
+        nltk.download('punkt', quiet=True)
+        nltk.download('punkt_tab', quiet=True)
+    except Exception as e:
+        print(f"NLTK download warning: {e}. If offline, ensure punkt is pre-installed.")
+
+# --- Zero Dependency Extractors & Tools ---
+import fitz  # PyMuPDF
+import mobi
+from ebooklib import epub, ITEM_DOCUMENT, ITEM_COVER, ITEM_IMAGE
+import imageio_ffmpeg
+FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+
+import logging
+import sys
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+
+logging.getLogger("asyncio").setLevel(logging.CRITICAL)
+
+import transformers
+transformers.utils.logging.set_verbosity_info()
+
+logging.getLogger("torch").setLevel(logging.DEBUG)
+transformers.utils.logging.set_verbosity_debug()
+
+
+# --- OmniVoice Engine Imports ---
+from omnivoice import OmniVoice, OmniVoiceGenerationConfig
+
+device = "cuda" if torch.cuda.is_available() else "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu"
+print(f"Using Device: {device}")
+
+# --- Load OmniVoice Model ---
+CHECKPOINT = os.environ.get("OMNIVOICE_MODEL", "k2-fsa/OmniVoice")
+print(f"Loading OmniVoice model from {CHECKPOINT} to {device} ...")
+model = OmniVoice.from_pretrained(
+    CHECKPOINT,
+    device_map=device,
+    load_asr=True,
+    torch_dtype=torch.float16  
+)
+sampling_rate = model.sampling_rate
+print("OmniVoice Model loaded successfully!")
+
+class EbookProgressUpdater:
+    def __init__(self, progress, num_total_chunks, ebook_idx, num_ebooks, start_time):
+        self._progress = progress
+        self.num_total_chunks = num_total_chunks
+        self.ebook_idx = ebook_idx
+        self.num_ebooks = num_ebooks
+        self.start_time = start_time
+        self.current_chunk_idx = 0
+
+    def set_chunk_index(self, i):
+        self.current_chunk_idx = i
+
+    def __call__(self, value, desc=None):
+        chunk_percent = 0.0
+        if desc:
+            match = re.search(r'(\d+\.?\d*)%', desc)
+            if match:
+                try: chunk_percent = float(match.group(1))
+                except ValueError: chunk_percent = 0.0
+
+        book_progress_fraction = (self.current_chunk_idx + (chunk_percent / 100.0)) / self.num_total_chunks
+        book_progress_percent = book_progress_fraction * 100
+        elapsed_seconds = time.time() - self.start_time
+        
+        elapsed_hours = int(elapsed_seconds // 3600)
+        elapsed_minutes = int((elapsed_seconds % 3600) // 60)
+        elapsed_secs = int(elapsed_seconds % 60)
+        elapsed_str = f"{elapsed_hours:02d}:{elapsed_minutes:02d}:{elapsed_secs:02d}"
+
+        etr_str = "Calculating..."
+        if elapsed_seconds > 2 and book_progress_fraction > 0.001:
+            try:
+                total_estimated_time = elapsed_seconds / book_progress_fraction
+                etr_seconds = max(0, total_estimated_time - elapsed_seconds)
+                etr_hours = int(etr_seconds // 3600)
+                etr_minutes = int((etr_seconds % 3600) // 60)
+                etr_secs = int(etr_seconds % 60)
+                etr_str = f"{etr_hours:02d}:{etr_minutes:02d}:{etr_secs:02d}"
+            except ZeroDivisionError:
+                 etr_str = "Calculating..."
+
+        if self.num_ebooks > 1:
+            final_desc = f"Current Book: {self.ebook_idx + 1}/{self.num_ebooks} ({book_progress_percent:.1f}%) | Chunk {self.current_chunk_idx + 1}/{self.num_total_chunks} | Elapsed: {elapsed_str} | ETR: {etr_str}"
+        else:
+            final_desc = f"Chunk {self.current_chunk_idx + 1}/{self.num_total_chunks} | Elapsed: {elapsed_str} | ETR: {etr_str}"
+
+        self._progress(value, desc=final_desc)
+
+def convert_numbers_to_words(txt):
+    txt = re.sub(r'\b(1[0-9]{3}|20[0-9]{2})\b', lambda m: num2words(int(m.group(0)), to='year'), txt)
+    txt = re.sub(r'(\d+)(st|nd|rd|th)\b', lambda m: num2words(int(m.group(1)), to='ordinal'), txt, flags=re.IGNORECASE)
+    def number_replacer(match):
+        num_str = match.group(0).replace(',', '')
+        try: return num2words(Decimal(num_str))
+        except: return num_str
+    number_pattern = r'\b\d{1,3}(?:,\d{3})*\.\d+\b|\b\d{1,3}(?:,\d{3})*\b'
+    txt = re.sub(number_pattern, number_replacer, txt)
+    return txt
+
+def strip_footnotes(text: str) -> str:
+    text = re.sub(r'\[\d+(?:,\s*\d+|-\d+)*\]', '', text)
+    text = re.sub(r'\[(?:sic|ibid|ref|page\s\d+)\]', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'(?<=\w)[\*\†\‡\§]\d*', '', text)
+    text = re.sub(r'^\s*[\*\†\‡\§]\d*\s*', '', text, flags=re.MULTILINE)
+    text = re.sub(r'(?<=[a-zA-Z])\.\d{1,3}\b', '.', text)
+    text = re.sub(r'\(\s*[A-Z][a-z]+,?\s+\d{4}\s*\)', '', text)
+    text = re.sub(r'^\s*\d+\b\s*', '', text, flags=re.MULTILINE)
+    text = re.sub(r' {2,}', ' ', text)
+    return text.strip()
+
+
+# --- SAFER CONTEXT-AWARE ABBREVIATION DISAMBIGUATORS ---
+
+def disambiguate_gravity(text: str) -> str:
+    # 1. Match obvious plurals "gs", "Gs", "g's", "G's" directly after digits (e.g. 3gs, 3 G's).
+    # grams is almost never written as "gs" in book literature, making this highly reliable.
+    text = re.sub(r'\b(\d+(?:\.\d+)?)\s*(?:gs|Gs|g\'s|G\'s)\b', r'\1 Gs', text)
+    
+    # 2. Match case-sensitive uppercase "G" (e.g. 3G, 3 G).
+    # If a cellular network context is detected (e.g. "5G network"), leave it as 'G' so TTS reads "five gee".
+    # Otherwise, convert to gravity "Gs" (pronounced "gees").
+    def uppercase_g_replacer(match):
+        num = match.group(1)
+        following_text = text[match.end():match.end()+40].lower()
+        network_words = ["network", "cellular", "tower", "data", "phone", "signal", "lte", "wifi", "tech", "generation"]
+        if any(word in following_text for word in network_words):
+            return f"{num} G"
+        return f"{num} Gs"
+        
+    text = re.sub(r'\b(\d+(?:\.\d+)?)\s*G\b', uppercase_g_replacer, text)
+    
+    # 3. Match lowercase "g" contextually.
+    # Search for surrounding context verbs or descriptors relating to physics/acceleration.
+    gravity_verbs = ["pull", "sustained", "experience", "gravity", "accelerat", "withstand", "turn", "maneuver", "burn", "thrust", "force", "vector", "pilot"]
+    
+    def lowercase_g_replacer(match):
+        num = match.group(1)
+        start_pos = max(0, match.start() - 60)
+        end_pos = min(len(text), match.end() + 60)
+        context = text[start_pos:end_pos].lower()
+        
+        # If standard aviation/science-fiction words are nearby, convert to gravity "Gs"
+        if any(verb in context for verb in gravity_verbs):
+            return f"{num} Gs"
+        # Otherwise default to standard grams weight units
+        return f"{num} grams"
+        
+    text = re.sub(r'\b(\d+(?:\.\d+)?)\s*g\b', lowercase_g_replacer, text)
+    return text
+
+def disambiguate_meters_and_million(text: str) -> str:
+    # Help isolate lowercase "m" (meters) from "M" / "m" (million shorthand)
+    million_nouns = ["copies", "views", "users", "people", "subscribers", "dollars", "pounds", "euros", "yen", "members", "citizens", "inhabitants"]
+    
+    def m_replacer(match):
+        num = match.group(1)
+        unit = match.group(2)
+        following_text = text[match.end():match.end()+40].lower()
+        
+        if any(noun in following_text for noun in million_nouns):
+            return f"{num} million"
+        if unit == 'M':
+            return f"{num} million"
+        return f"{num} meters" # Default lowercase 'm' to meters in narrative prose
+        
+    text = re.sub(r'\b(\d+(?:\.\d+)?)\s*(m|M)\b', m_replacer, text)
+    return text
+
+
+def clean_and_normalize_text(raw_text: str) -> str:
+    # --- NESTED HIGH-PRIORITY TIME NORMALIZER ---
+    def normalize_times(t_text: str) -> str:
+        # Pattern 1: Colon-separated times, e.g., 2:00 P.M., 10:30 am, 12:05
+        time_colon_pattern = r'\b(\d{1,2}):(\d{2})\s*(a\.m\.(?!\w)|p\.m\.(?!\w)|am\b|pm\b)?'
+        
+        def time_colon_replacer(match):
+            hours = int(match.group(1))
+            minutes = int(match.group(2))
+            suffix = match.group(3)
+            
+            if hours < 1 or hours > 24 or minutes < 0 or minutes > 59:
+                return match.group(0)
+            
+            hours_word = num2words(hours)
+            
+            if minutes == 0:
+                minutes_word = "o'clock"
+            elif minutes < 10:
+                minutes_word = f"oh {num2words(minutes)}"
+            else:
+                minutes_word = num2words(minutes)
+                
+            suffix_word = ""
+            if suffix:
+                clean_suffix = suffix.lower().replace(".", "").strip()
+                if clean_suffix == "am":
+                    suffix_word = " ay em"
+                elif clean_suffix == "pm":
+                    suffix_word = " pee em"
+            
+            return f"{hours_word} {minutes_word}{suffix_word}"
+
+        t_text = re.sub(time_colon_pattern, time_colon_replacer, t_text, flags=re.IGNORECASE)
+        
+        # Pattern 2: Single-digit hour times with direct AM/PM suffix, e.g., 2 PM, 10 a.m.
+        time_standalone_pattern = r'\b(\d{1,2})\s*(a\.m\.(?!\w)|p\.m\.(?!\w)|am\b|pm\b)'
+        
+        def time_standalone_replacer(match):
+            hours = int(match.group(1))
+            suffix = match.group(2)
+            
+            if hours < 1 or hours > 24:
+                return match.group(0)
+            
+            hours_word = num2words(hours)
+            clean_suffix = suffix.lower().replace(".", "").strip()
+            suffix_word = " ay em" if clean_suffix == "am" else " pee em"
+            
+            return f"{hours_word}{suffix_word}"
+            
+        t_text = re.sub(time_standalone_pattern, time_standalone_replacer, t_text, flags=re.IGNORECASE)
+        return t_text
+
+    text = raw_text
+    
+    # --- 1. RUN TIME NORMALIZATION ---
+    text = normalize_times(text)
+    # ---------------------------------
+    
+    text = re.sub(r'\*\s*\d+\b', '', text) 
+    text = re.sub(r'\[[^\]]*\]', '', text)  
+    academic_terms = r'\b(?:spp?\.?|ssp\.?|subsp\.?|var\.?|f\.?|cf\.?|e\.g\.?|i\.e\.?|viz\.?|see|fig\.?|plate|chapter|probably)\b'
+    year_pattern = r'\d{4}'
+    combined_pattern = rf'\([^)]*(?:{academic_terms}|{year_pattern})[^)]*\)'
+    text = re.sub(combined_pattern, '', text, flags=re.IGNORECASE)
+    text = re.sub(r'#(\d)', r'number \1', text)     
+    text = re.sub(r'#([a-zA-Z])', r'hashtag \1', text) 
+    text = text.replace('#', ' pound ')               
+    
+    # --- UPDATED CURRENCY REPLACER (With Shorthand m/M, b/B, k/K Support) ---
+    def currency_replacer(match):
+        symbol = match.group(1)
+        amount = match.group(2)
+        multiplier = match.group(3) 
+        
+        mapping = {'$': 'dollar', '£': 'pound', '€': 'euro', '¥': 'yen'}
+        curr_name = mapping.get(symbol, 'dollars')
+        
+        if multiplier:
+            multiplier = multiplier.lower().strip()
+            shorthand_map = {'m': 'million', 'b': 'billion', 'k': 'thousand'}
+            multiplier = shorthand_map.get(multiplier, multiplier)
+        
+        # Make currency plural if amount is not exactly "1" or if a multiplier exists
+        if amount != "1" or multiplier: 
+            curr_name += "s"
+            
+        if multiplier:
+            return f"{amount} {multiplier} {curr_name}"
+        else:
+            return f"{amount} {curr_name}"
+
+    # Captures shorthand suffixes explicitly alongside full words ($5m, $50k)
+    currency_pattern = r'([$£€¥])(\d+(?:,\d{3})*(?:\.\d+)?)\s*(m\b|M\b|b\b|B\b|k\b|K\b|million|billion|trillion|thousand|hundred)?'
+    text = re.sub(currency_pattern, currency_replacer, text)
+    # ---------------------------------
+
+    symbol_map = {'—': ', ', '–': ', ', '&': ' and ', '%': ' percent ', '@': ' at ', 'µm': ' micrometers ', '°': ' degrees ', '+': ' plus ', '=': ' equals ', '/': ' or '}
+    for old, new in symbol_map.items(): text = text.replace(old, new)
+    
+    text = re.sub(r'\bSt\.\s+(?=[A-Z])', 'Saint ', text)
+    text = re.sub(r'(?<=\d)\s*St\.\b', ' Street', text, flags=re.IGNORECASE)
+    text = re.sub(r'(?<=[A-Z][a-z])\s+St\.\b', ' Street', text)
+    
+    safe_abbreviations = {"Mr.": "Mister", "Mrs.": "Missus", "Ms.": "Miss", "Dr.": "Doctor", "Prof.": "Professor", "Rev.": "Reverend", "Hon.": "Honorable", "Jr.": "Junior", "Sr.": "Senior", "Gen.": "General", "Adm.": "Admiral", "Capt.": "Captain", "Cmdr.": "Commander", "Lt.": "Lieutenant", "Sgt.": "Sergeant", "Co.": "Company", "Corp.": "Corporation", "Inc.": "Incorporated", "Ltd.": "Limited", "LLC": "Limited Liability Company", "vs.": "versus", "et al.": "et alia", "etc.": "et cetera", "e.g.": "for example", "i.e.": "that is", "Ph.D.": "Doctor of Philosophy", "M.A.": "Master of Arts", "B.A.": "Bachelor of Arts", "pp.": "pages", "vol.": "volume", "U.S.": "United States", "U.S.A.": "United States of America", "U.K.": "United Kingdom", "E.U.": "European Union", "Ave.": "Avenue", "Blvd.": "Boulevard", "Rd.": "Road", "sq.": "square", "cu.": "cubic", "deg.": "degrees", "A.M.": "ay em", "P.M.": "pee em", "Jan.": "January", "Feb.": "February", "Mar.": "March", "Apr.": "April", "Jun.": "June", "Jul.": "July", "Aug.": "August", "Sep.": "September", "Oct.": "October", "Nov.": "November", "Dec.": "December", "approx.": "approximately", "dept.": "department", "apt.": "apartment", "est.": "established"}
+    
+    # --- CONTEXT DISAMBIGUATORS ---
+    text = disambiguate_gravity(text)
+    text = disambiguate_meters_and_million(text)
+    
+    # --- GENERAL UNIT ABBREVIATIONS (Removed 'g' and 'm' to avoid collisions) ---
+    unit_abbreviations = {
+        "mm": "millimeters", "cm": "centimeters", "km": "kilometers", 
+        "mg": "milligrams", "kg": "kilograms", "ft": "feet", "yd": "yards", 
+        "mi": "miles", "oz": "ounces", "lb": "pounds", "lbs": "pounds", 
+        "mph": "miles per hour", "kph": "kilometers per hour"
+    }
+    for abbr, full in unit_abbreviations.items(): 
+        text = re.sub(rf'(?<=\d)\s*{re.escape(abbr)}\b', f' {full}', text, flags=re.IGNORECASE)
+    # ----------------------------------
+    
+    for abbr, full in safe_abbreviations.items(): 
+        text = re.sub(r'\b' + re.escape(abbr) + r'(?!\w)', full, text, flags=re.IGNORECASE)
+    
+    # --- SAFER DIRECTION / REFERENCE NORMALIZERS ---
+    # Removed N., S., E., W. entirely. Keeping them globally causes initials (like E. G. Smith) to read as "East".
+    # Only replace "p." to "page" if it matches standard page citation structures (e.g. p. 120)
+    text = re.sub(r'\bp\.\s*(\d+)\b', r'page \1', text, flags=re.IGNORECASE)
+    # -----------------------------------------------
+    
+    cleaned_text = convert_numbers_to_words(text)
+    cleaned_text = cleaned_text.replace('…', '.')
+    cleaned_text = cleaned_text.replace('"', ' ').replace('“', ' ').replace('”', ' ')
+    cleaned_text = cleaned_text.replace('()', '').replace('( )', '')
+    cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
+    
+    return cleaned_text
+
+# --- Extractors (Updated for Covers & Metadata) ---
+def get_epub_meta(book, namespace, name):
+    meta = book.get_metadata(namespace, name)
+    if meta and len(meta) > 0 and isinstance(meta[0], tuple) and len(meta[0]) > 0:
+        return meta[0][0]
+    return None
+
+def read_epub(file_path):
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        book = epub.read_epub(file_path)
+        text_content =[]
+        
+        # Robust metadata extraction
+        title = get_epub_meta(book, 'DC', 'title')
+        author = get_epub_meta(book, 'DC', 'creator')
+        
+        # Cover extraction
+        cover_bytes = None
+        try:
+            for item in book.get_items_of_type(ITEM_COVER):
+                cover_bytes = item.get_content()
+                break
+            
+            # Fallback cover extraction (if cover is tagged as image)
+            if not cover_bytes:
+                for item in book.get_items_of_type(ITEM_IMAGE):
+                    name = item.get_name().lower()
+                    item_id = getattr(item, 'id', '').lower()
+                    if 'cover' in name or 'cover' in item_id:
+                        cover_bytes = item.get_content()
+                        break
+        except Exception as e:
+            print(f"EPUB cover extraction warning: {e}")
+            
+        for item in book.get_items_of_type(ITEM_DOCUMENT):
+            soup = BeautifulSoup(item.get_content(), 'html.parser')
+            for unwanted in soup(["aside", "footnote", "reftag", "nav", "footer"]):
+                unwanted.decompose()
+            text_content.append(soup.get_text(separator=' ', strip=True))
+            
+        return ' '.join(text_content), title, author, cover_bytes
+
+def read_pdf(file_path):
+    doc = fitz.open(file_path)
+    title = doc.metadata.get("title")
+    author = doc.metadata.get("author")
+    
+    # Extract First Page as Cover Image
+    cover_bytes = None
+    try:
+        if len(doc) > 0:
+            page = doc.load_page(0)
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            cover_bytes = pix.tobytes("jpeg")
+    except Exception as e:
+        print(f"PDF cover extraction warning: {e}")
+        
+    text_content = [page.get_text() for page in doc]
+    return ' '.join(text_content), title, author, cover_bytes
+
+def read_mobi(file_path):
+    tempdir, ext_path = mobi.extract(file_path)
+    cover_bytes = None
+    if ext_path.lower().endswith('.epub'):
+        text, title, author, cover_bytes = read_epub(ext_path)
+    else:
+        with open(ext_path, 'r', encoding='utf-8', errors='ignore') as f:
+            soup = BeautifulSoup(f.read(), 'html.parser')
+            text = soup.get_text(separator=' ', strip=True)
+            title, author = None, None
+    shutil.rmtree(tempdir, ignore_errors=True)
+    return text, title, author, cover_bytes
+
+def extract_text_and_metadata(file_path):
+    ext = os.path.splitext(file_path)[1].lower()
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    
+    raw_text = ""
+    cover_bytes = None
+    t, a = None, None
+    
+    if ext == '.epub': raw_text, t, a, cover_bytes = read_epub(file_path)
+    elif ext == '.pdf': raw_text, t, a, cover_bytes = read_pdf(file_path)
+    elif ext in['.mobi', '.azw3']: raw_text, t, a, cover_bytes = read_mobi(file_path)
+    elif ext == '.txt':
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f: raw_text = f.read()
+    elif ext in['.htm', '.html']:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            soup = BeautifulSoup(f.read(), 'html.parser')
+            raw_text = soup.get_text(separator=' ', strip=True)
+    else: raise ValueError(f"Unsupported file format: {ext}")
+    
+    # Fallback Metadata Fix (if the book properties are left blank/untitled)
+    if t and t.strip() and t.strip().lower() != "untitled":
+        title = t.strip()
+    else:
+        title = base_name.replace("_", " ").title()
+        
+    if a and a.strip() and a.strip().lower() != "untitled":
+        author = a.strip()
+    else:
+        author = "Unknown Author"
+        
+    if not raw_text.strip(): raise ValueError("No text could be extracted from the file.")
+    text = clean_and_normalize_text(raw_text)
+    
+    return text, title, author, cover_bytes
+
+def sanitize_filename(filename):
+    if not filename:
+        return "unknown_file"
+    sanitized = re.sub(r'[\/*?:"<>|\']', "", filename)
+    sanitized = sanitized.replace(" ", "_")
+    sanitized = sanitized.strip(". ")
+    return sanitized[:100]
+
+def ensure_directory(directory_path):
+    os.makedirs(directory_path, exist_ok=True)
+
+def show_converted_audiobooks():
+    output_dir = os.path.abspath(os.path.join("Working_files", "Book"))
+    if not os.path.exists(output_dir): return []
+    files =[os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.endswith(('.mp3', '.m4b'))]
+    return files if files else[]
+
+def basic_tts(ref_audio_input, ref_text_input, gen_file_input, speed, max_phrase_length, max_chunk_length, num_steps, cfg, progress=gr.Progress()):
+    # Safety Guard Clause to prevent crash if run with empty book inputs
+    if not gen_file_input:
+        raise gr.Error("Please upload at least one eBook file to generate audio!")
+
+    try:
+        processed_audiobooks =[]
+        num_ebooks = len(gen_file_input)
+        ebook_frac = {"extract_text": 0.05, "infer": 0.90, "mp3_meta": 0.05}
+
+        progress(0, desc="Preprocessing reference audio for OmniVoice...")
+        ref_text = ref_text_input or ""
+        try:
+            voice_clone_prompt = model.create_voice_clone_prompt(
+                ref_audio=ref_audio_input,
+                ref_text=ref_text if ref_text.strip() else None,
+            )
+        except Exception as e:
+            raise gr.Error(f"Error preprocessing reference audio: {e}")
+
+        MAX_PHRASE_LENGTH = int(max_phrase_length)
+        MAX_CHUNK_LENGTH_CHARS = int(max_chunk_length)
+        NUM_GENERATION_STEPS = int(num_steps)
+
+        for idx, ebook_file_data in enumerate(gen_file_input):
+            current_ebook_base_progress = idx / float(num_ebooks)
+            progress_offset_within_ebook = 0.0
+            original_ebook_path = ebook_file_data.name
+            
+            if not os.path.exists(original_ebook_path):
+                continue
+
+            progress(current_ebook_base_progress, desc=f"Ebook {idx+1}/{num_ebooks}: Extracting text...")
+            try:
+                gen_text, ebook_title, ebook_author, cover_bytes = extract_text_and_metadata(original_ebook_path)
+            except Exception as e:
+                print(f"Extraction error: {e}")
+                continue
+
+            progress_offset_within_ebook += ebook_frac["extract_text"]
+            
+            overall_infer_start_frac = current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks)
+            
+            # UNIQUE DIRECTORY ASSIGNMENT: Appends uuid prefix to prevent multi-user collisions
+            run_uuid = uuid.uuid4().hex[:8]
+            temp_chunks_dir = os.path.abspath(os.path.join(
+                "Working_files", "temp_audio_chunks", 
+                f"{sanitize_filename(ebook_title)}_{run_uuid}"
+            ))
+            ensure_directory(temp_chunks_dir)
+            chunk_file_paths =[]
+
+            initial_sentences = sent_tokenize(gen_text)
+            intermediate_phrases =[]
+            for sentence in initial_sentences:
+                if len(sentence) <= MAX_PHRASE_LENGTH: intermediate_phrases.append(sentence)
+                else:
+                    current_part = sentence
+                    while len(current_part) > MAX_PHRASE_LENGTH:
+                        split_pos = -1
+                        delimiters = [',', ';', '—', '–']
+                        for delimiter in delimiters:
+                            pos = current_part.rfind(delimiter, 0, MAX_PHRASE_LENGTH)
+                            if pos > split_pos: split_pos = pos
+                        if split_pos == -1: split_pos = current_part.rfind(' ', 0, MAX_PHRASE_LENGTH)
+                        if split_pos == -1: split_pos = MAX_PHRASE_LENGTH
+                        intermediate_phrases.append(current_part[:split_pos+1].strip())
+                        current_part = current_part[split_pos+1:].strip()
+                    if current_part: intermediate_phrases.append(current_part)
+
+            text_super_chunks =[]
+            current_chunk = ""
+            for phrase in intermediate_phrases:
+                if len(current_chunk) + len(phrase) + 1 > MAX_CHUNK_LENGTH_CHARS:
+                    if current_chunk: text_super_chunks.append(current_chunk)
+                    current_chunk = phrase
+                else:
+                    if current_chunk: current_chunk += " " + phrase
+                    else: current_chunk = phrase
+            if current_chunk: text_super_chunks.append(current_chunk)
+
+            del gen_text
+            gc.collect()
+
+            num_super_chunks = len(text_super_chunks)
+            if num_super_chunks == 0: continue
+
+            ebook_start_time = time.time()
+            progress_updater = EbookProgressUpdater(progress, num_super_chunks, idx, num_ebooks, ebook_start_time)
+
+            gen_config = OmniVoiceGenerationConfig(num_step=NUM_GENERATION_STEPS, guidance_scale=float(cfg))
+            for i, text_chunk in enumerate(text_super_chunks):
+                progress_updater.set_chunk_index(i)
+                print(f"\n[DEBUG] Starting Chunk {i+1}/{num_super_chunks}")
+                print(f"[DEBUG] Text Snippet: {text_chunk[:100]}...")
+                chunk_progress_start = overall_infer_start_frac + (i / num_super_chunks) * (ebook_frac["infer"] / num_ebooks)
+                progress_updater(chunk_progress_start)
+                try:
+                    with torch.no_grad():
+                        audio_tensor = model.generate(text=text_chunk, voice_clone_prompt=voice_clone_prompt, speed=float(speed), generation_config=gen_config)
+                    wave_data = audio_tensor[0] if isinstance(audio_tensor, (list, tuple)) else audio_tensor
+                    if hasattr(wave_data, "cpu"):
+                        wave_data = wave_data.cpu().numpy()
+                    
+                    wave_chunk = wave_data.flatten()
+                    if wave_chunk is not None and wave_chunk.any():
+                        chunk_path = os.path.join(temp_chunks_dir, f"chunk_{i:04d}.wav")
+                        sf.write(chunk_path, wave_chunk, sampling_rate)
+                        chunk_file_paths.append(chunk_path)
+                finally:
+                    if 'audio_tensor' in locals(): del audio_tensor
+                    if 'wave_chunk' in locals(): del wave_chunk
+                    gc.collect()
+                    if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+            progress_offset_within_ebook += ebook_frac["infer"]
+            progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), desc=f"Ebook {idx+1}/{num_ebooks}: Finalizing MP3...")
+            
+            sanitized_title = sanitize_filename(ebook_title) or f"audiobook_{idx}"
+            final_mp3_dir = os.path.abspath(os.path.join("Working_files", "Book"))
+            final_mp3_path = os.path.join(final_mp3_dir, f"{sanitized_title}.mp3")
+
+            try:
+                concat_list_path = os.path.join(temp_chunks_dir, "concat_list.txt")
+                with open(concat_list_path, 'w', encoding='utf-8') as f:
+                    for path in chunk_file_paths: f.write(f"file '{os.path.basename(path)}'\n")
+
+                ensure_directory(final_mp3_dir)
+                
+                ffmpeg_command =[FFMPEG_EXE, '-f', 'concat', '-safe', '0', '-i', 'concat_list.txt']
+                
+                has_cover = False
+                cover_path = os.path.join(temp_chunks_dir, "cover.jpg")
+                if cover_bytes:
+                    try:
+                        with open(cover_path, "wb") as f:
+                            f.write(cover_bytes)
+                        has_cover = True
+                    except Exception as e:
+                        print(f"Failed to write cover image: {e}")
+                
+                if has_cover:
+                    ffmpeg_command.extend([
+                        '-i', 'cover.jpg',
+                        '-map', '0:a',
+                        '-map', '1:v',
+                        '-c:v', 'mjpeg',
+                        '-disposition:v', 'attached_pic'
+                    ])
+                
+                ffmpeg_command.extend([
+                    '-c:a', 'libmp3lame', 
+                    '-b:a', '192k', 
+                    '-id3v2_version', '3', 
+                    '-metadata', f'title={ebook_title}', 
+                    '-metadata', f'artist={ebook_author}',   
+                    '-metadata', f'album={ebook_title}',     
+                    '-y', os.path.abspath(final_mp3_path)
+                ])
+
+                subprocess.run(ffmpeg_command, cwd=temp_chunks_dir, check=True)
+                
+                processed_audiobooks.append(final_mp3_path)
+                yield processed_audiobooks 
+                
+            except Exception as e:
+                print(f"FFmpeg error: {e}")
+            finally:
+                if os.path.exists(temp_chunks_dir): shutil.rmtree(temp_chunks_dir)
+
+        progress(1.0, desc=f"All {num_ebooks} eBook(s) processing finished.")
+
+    except Exception as e:
+        print("\n" + "="*50)
+        print("CRITICAL ERROR DURING TTS PROCESSING")
+        traceback.print_exc()
+        print("="*50 + "\n")
+        raise gr.Error(f"An error occurred: {str(e)}")
+
+DEFAULT_REF_AUDIO_PATH = "default_voice.mp3"
+DEFAULT_REF_TEXT = "The birch canoe slid on the smooth planks. Glue the sheet to the dark blue background. It's easy to tell the depth of a well. The juice of lemons makes fine punch."
+
+def create_gradio_app():
+    with gr.Blocks() as app:
+        gr.Markdown("# eBook to Audiobook with OmniVoice")
+        
+        # --- INPUT SECTION ---
+        with gr.Column():
+            ref_audio_input = gr.Audio(
+                label="Use Default Voice, Upload Voice File, or Use Record Button", 
+                type="filepath", 
+                value=DEFAULT_REF_AUDIO_PATH
+            )
+            gen_file_input = gr.File(
+                label="Upload eBooks (Batch Support)", 
+                file_types=[".epub", ".mobi", ".pdf", ".txt", ".html"], 
+                file_count="multiple", 
+                type="filepath"
+            )
+            generate_btn = gr.Button("Start Processing", variant="primary")
+
+        # --- OUTPUT SECTION ---
+        with gr.Column():
+            gr.Markdown("### Current Batch Progress")
+            batch_output = gr.Files(label="Audiobooks Finishing in Current Batch")
+            
+            gr.Markdown("### Completed Audiobooks Library")
+            library_output = gr.Files(label="All Saved Audiobooks in Output Folder")
+            show_audiobooks_btn = gr.Button("Refresh / Show All Saved Audiobooks", variant="secondary")
+
+        with gr.Accordion("Advanced Settings", open=False):
+            ref_text_input = gr.Textbox(label="Reference Text", lines=2, value=DEFAULT_REF_TEXT)
+            speed_slider = gr.Slider(label="Speech Speed", minimum=0.3, maximum=2.0, value=1.0, step=0.1)
+            num_steps_slider = gr.Slider(label="Generation Steps", minimum=10, maximum=100, value=70, step=1)
+            cfg_slider = gr.Slider(label="CFG Scale (Guidance)", minimum=1.0, maximum=7.0, value=4.0, step=0.1, info="2.0 is recommended for naturalness; 4.0 is punchier.")
+            max_phrase_slider = gr.Slider(label="Max Phrase Length", minimum=200, maximum=2000, value=300, step=50)
+            max_chunk_slider = gr.Slider(label="Max Chunk Length", minimum=500, maximum=4000, value=800, step=50)
+
+        # 1. Run basic_tts and yield files to batch_output.
+        # 2. Chain .then() to automatically trigger a library reload when the batch completes.
+        generate_btn.click(
+            basic_tts,
+            inputs=[ref_audio_input, ref_text_input, gen_file_input, speed_slider, max_phrase_slider, max_chunk_slider, num_steps_slider, cfg_slider],
+            outputs=[batch_output]
+        ).then(
+            show_converted_audiobooks,
+            inputs=[],
+            outputs=[library_output],
+            queue=False
+        )
+        
+        # Manual Refresh Target
+        show_audiobooks_btn.click(
+            show_converted_audiobooks, 
+            inputs=[], 
+            outputs=[library_output],
+            queue=False  
+        )
+        
+        # Automatically load previously completed books on page load
+        app.load(show_converted_audiobooks, inputs=[], outputs=[library_output], queue=False)
+        
+    return app
+
+if __name__ == "__main__":
+    app = create_gradio_app()
+    app.queue(default_concurrency_limit=2).launch(theme=gr.themes.Ocean(), server_name=os.environ.get("OMNIVOICE_HOST", "127.0.0.1"), server_port=int(os.environ.get("OMNIVOICE_PORT", 7860)), max_threads=10, show_error=True, quiet=False)
